@@ -1,0 +1,192 @@
+/* =============================================================================
+ *  BinomialTreeEngine::calculate
+ *  Valorisation d'une option par arbre binomial (Cox-Ross-Rubinstein)
+ * =============================================================================
+ *
+ *  PRINCIPE
+ *  --------
+ *  Le prix d'une option est l'esperance actualisee de son payoff sous la mesure
+ *  risque-neutre. Cette esperance n'est pas calculable directement, on discretise
+ *  donc la dynamique du sous-jacent : sur chaque intervalle dt, le prix est
+ *  multiplie soit par u (hausse), soit par d (baisse). Sur cet arbre fini,
+ *  l'esperance devient une somme exacte que l'on evalue en remontant de
+ *  l'echeance vers aujourd'hui (induction retrograde).
+ *
+ *  Interet par rapport a une formule fermee (Black-Scholes) : l'arbre permet de
+ *  traiter l'exercice anticipe, donc les options americaines.
+ *
+ *
+ *  1. CALIBRAGE
+ *  ------------
+ *      dt = T / N
+ *
+ *      u  = exp(sigma * sqrt(dt))      amplitude de la hausse
+ *      d  = 1 / u                      la baisse annule exactement la hausse
+ *
+ *  u ne depend que de la volatilite. Justification : la variance du log-rendement
+ *  sur dt vaut sigma^2 * dt, et dans l'arbre le log-rendement vaut +/- ln(u),
+ *  donc (ln u)^2 = sigma^2 * dt, soit ln u = sigma * sqrt(dt).
+ *
+ *      d_f = exp(-r * dt)              actualisation sur UN pas
+ *
+ *  Applique a chaque remontee, d_f se compose N fois et donne exp(-r*T).
+ *
+ *      p = ( exp((r - q) * dt) - d ) / (u - d)
+ *
+ *  p n'est PAS une probabilite reelle : c'est le poids risque-neutre, defini par
+ *  la seule condition que le sous-jacent croisse au taux sans risque net du
+ *  dividende :
+ *
+ *      p * (S*u) + (1-p) * (S*d) = S * exp((r-q)*dt)
+ *   => p * u + (1-p) * d         = exp((r-q)*dt)
+ *   => p                         = ( exp((r-q)*dt) - d ) / (u - d)
+ *
+ *  A verifier en amont : 0 < p < 1. Sinon le modele admet un arbitrage et les
+ *  prix retournes sont depourvus de sens (arrive si dt est grand devant sigma).
+ *
+ *
+ *  2. GEOMETRIE DE L'ARBRE
+ *  -----------------------
+ *  Un noeud est identifie par (i, j) : i = pas de temps, j = nombre de hausses.
+ *
+ *      S(i, j) = S0 * u^j * d^(i-j)
+ *
+ *  L'ordre des hausses/baisses n'importe pas (la multiplication commute), donc
+ *  la colonne i ne contient que i+1 noeuds distincts, et non 2^i chemins.
+ *
+ *  Exemple pour N = 3. Chaque noeud est relie aux deux noeuds de la colonne
+ *  suivante : (i+1, j) en cas de baisse, (i+1, j+1) en cas de hausse.
+ *
+ *                                          (3,3)
+ *                              (2,2)
+ *                  (1,1)                   (3,2)
+ *      (0,0)                   (2,1)
+ *                  (1,0)                   (3,1)
+ *                              (2,0)
+ *                                          (3,0)
+ *
+ *  Vu par niveau de prix, la recombinaison devient evidente : un meme niveau
+ *  est atteint a plusieurs dates, et le choix d = 1/u place S0 sur la grille
+ *  aux pas pairs.
+ *
+ *      niveau  |   i=0        i=1        i=2        i=3
+ *     ---------+---------------------------------------------
+ *        +3    |                                    S0*u^3
+ *        +2    |                         S0*u^2
+ *        +1    |              S0*u                  S0*u
+ *         0    |   S0                    S0
+ *        -1    |              S0*d                  S0*d
+ *        -2    |                         S0*d^2
+ *        -3    |                                    S0*d^3
+ *
+ *  Consequence utilisee par les grecques : S(2,1) = S0*u*d = S0 exactement.
+ *
+ *
+ *  3. BOUCLE ALLER : payoffs terminaux
+ *  -----------------------------------
+ *  A l'echeance il n'y a plus d'incertitude, l'option vaut son payoff.
+ *  On remplit tab avec les N+1 valeurs terminales.
+ *
+ *      tab[j] = payoff( S0 * u^j * d^(N-j) )        pour j = 0 .. N
+ *
+ *  tab est de taille N+1, soit la largeur maximale de l'arbre. L'arbre complet
+ *  n'est JAMAIS stocke : tab ne contient qu'une colonne a la fois.
+ *  Memoire O(N) au lieu de O(N^2).
+ *
+ *
+ *  4. BOUCLE RETOUR : induction retrograde
+ *  ---------------------------------------
+ *  i decroit de N-1 a 0. Pour chaque noeud (i, j), la valeur de continuation
+ *  est l'esperance risque-neutre des deux valeurs futures, actualisee d'un pas :
+ *
+ *      V_cont(i,j) = d_f * ( p * V(i+1, j+1) + (1-p) * V(i+1, j) )
+ *                  = d_f * ( p * tab[j+1]    + (1-p) * tab[j]    )
+ *
+ *  tab[j+1] porte le noeud du haut, tab[j] celui du bas, car au debut de
+ *  l'iteration tab contient encore la colonne i+1.
+ *
+ *  ECRITURE EN PLACE -- le point critique.
+ *  On ecrit tab[j] alors qu'on vient de lire tab[j]. Pendant la boucle interne
+ *  tab est dans un etat hybride :
+ *
+ *      indices 0 .. j-1    -> nouvelle colonne i (deja recalculee)
+ *      indices j .. i+1    -> ancienne colonne i+1 (encore necessaire)
+ *      indices i+2 .. N    -> valeurs perimees, plus jamais relues
+ *
+ *  Cela ne fonctionne QUE parce que j est croissant : la case ecrasee, tab[j],
+ *  ne sera plus relue, et l'iteration suivante lit tab[j+1] et tab[j+2], encore
+ *  intacts. Inverser le sens de la boucle interne corrompt silencieusement le
+ *  resultat, sans erreur ni crash.
+ *
+ *  EUROPEENNE :  tab[j] = V_cont
+ *      pas d'exercice avant l'echeance, la valeur est la valeur d'attente.
+ *
+ *  AMERICAINE :  tab[j] = max( V_cont, payoff(S(i,j)) )
+ *      en chaque noeud le detenteur compare l'exercice immediat a l'attente et
+ *      garde le meilleur. C'est un probleme d'arret optimal resolu par
+ *      programmation dynamique. Note : sur un call sans dividende (q = 0) le max
+ *      ne mord jamais, americain == europeen.
+ *
+ *  A la fin de la boucle, tab[0] = V(0,0) = prix aujourd'hui.
+ *
+ *
+ *  5. GRECQUES PAR DIFFERENCES FINIES SUR L'ARBRE
+ *  ----------------------------------------------
+ *  L'arbre fournit deja des valeurs d'option a des sous-jacents voisins : il
+ *  suffit de prendre des pentes. Les valeurs doivent etre capturees AVANT que
+ *  la remontee n'ecrase les cases concernees.
+ *
+ *  DELTA = dV/dS, capture a i = 1 (deux noeuds encadrant S0) :
+ *
+ *      delta = (V1_1 - V1_0) / (S1_1 - S1_0)      avec S1_1 = S0*u, S1_0 = S0*d
+ *
+ *  GAMMA = d2V/dS2, capture a i = 2 (trois points necessaires) :
+ *
+ *      pente_haut = (V2_2 - V2_1) / (S2_2 - S2_1)
+ *      pente_bas  = (V2_1 - V2_0) / (S2_1 - S2_0)
+ *      gamma      = (pente_haut - pente_bas) / ( 0.5 * (S2_2 - S2_0) )
+ *
+ *  Le denominateur est l'ecart entre les points milieux des deux intervalles.
+ *  Les intervalles sont inegaux (arbre multiplicatif), d'ou cette forme et non
+ *  la difference seconde centree uniforme.
+ *
+ *  THETA = dV/dt, calcule apres les boucles :
+ *
+ *      theta = (V2_1 - tab[0]) / (2 * dt)
+ *
+ *  V2_1 et tab[0] correspondent au MEME sous-jacent (S(2,1) = S0*u*d = S0) mais
+ *  a deux dates separees de 2*dt. C'est donc bien une derivee temporelle a
+ *  sous-jacent constant, en difference avant. Sans d = 1/u cette comparaison
+ *  serait invalide et melangerait du delta dans le theta.
+ *
+ *
+ *  6. COMPLEXITE
+ *  -------------
+ *      temps   : O(N^2)   -- (N+1)(N+2)/2 noeuds evalues
+ *      memoire : O(N)     -- un seul vecteur de taille N+1
+ *
+ *  Convergence du prix vers Black-Scholes en O(1/N), avec oscillations selon la
+ *  parite de N et la position du strike entre deux noeuds. N ~ 500-1000 en
+ *  pratique.
+ *
+ *
+ *  7. LIMITES CONNUES DE CETTE IMPLEMENTATION
+ *  ------------------------------------------
+ *  - Aucune garde sur steps_ : si steps_ < 3 les blocs i==2 et i==1 ne sont
+ *    jamais atteints et delta/gamma/theta restent silencieusement a 0.0.
+ *  - Aucune verification de 0 < p < 1.
+ *  - Dans le bloc if (i == 2), les trois "const double S2_2/S2_1/S2_0" locaux
+ *    MASQUENT les variables de fonction homonymes. Les trois affectations qui
+ *    precedent deviennent du code mort. Aucun bug numerique ici (les valeurs
+ *    coincident) mais c'est un piege a la relecture -> supprimer les locaux.
+ *  - Le test sur option.style() est refait a chaque noeud, soit O(N^2) appels
+ *    virtuels evitables. Hisser le style hors des boucles.
+ *  - std::pow(u, j) recalcule a chaque noeud. Un produit incremental (S *= u*u
+ *    en avancant en j) est nettement plus rapide.
+ *  - Les grecques sont evaluees a t = dt (delta) et t = 2*dt (gamma), pas en
+ *    t = 0. Pour N grand ce biais est negligeable, mais theta divise par un
+ *    2*dt minuscule devient numeriquement instable. Alternatives : re-pricing
+ *    avec bump du spot, ou arbre etendu de deux pas avant t = 0.
+ *
+ * =============================================================================
+ */
