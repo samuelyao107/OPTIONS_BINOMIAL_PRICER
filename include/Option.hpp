@@ -22,4 +22,4 @@ class Option {
             std::shared_ptr<Payoff> payoff_;
             double maturity_;
             ExerciseStyle style_;
-}
+};
