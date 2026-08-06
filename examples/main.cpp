@@ -24,8 +24,14 @@ int main() {
 
     PricingResult result = pricer.calculate(americanCall, market);
 
-    std::cout << "=== Résultats de Valorisation ===" << std::endl;
-    std::cout << "Prix (American Call) : " << result.price << " €" << std::endl;
+    std::cout << "=== Parameters used ===" << std::endl;
+    std::cout << "Spot price    : " << market.S0<< std::endl;
+    std::cout << "Risk free rate: " << market.r << std::endl;
+    std::cout << "q             : " << market.q<< std::endl;
+    std::cout << "sigma         : " << market.sigma<< std::endl;
+
+    std::cout << "=== Option Pricing Result ===" << std::endl;
+    std::cout << "Price (American Call) : " << result.price << " €" << std::endl;
     std::cout << "Delta (Δ)            : " << result.delta << std::endl;
     std::cout << "Gamma (Γ)            : " << result.gamma << std::endl;
     std::cout << "Theta (Θ)            : " << result.theta << " par an" << std::endl;
